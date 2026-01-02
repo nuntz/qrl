@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QRL</title>
+  <style>
+    :root {
+      --bg-1: #f6f1e8;
+      --bg-2: #f2e8d5;
+      --ink: #111111;
+      --muted: #6b6457;
+      --card: #ffffff;
+      --accent: #0d1b2a;
+      --error: #a32020;
+      --shadow: rgba(17, 17, 17, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(120% 120% at 10% 0%, #fff8ed 0%, var(--bg-1) 40%, var(--bg-2) 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 16px;
+    }
+
+    .card {
+      width: min(520px, 94vw);
+      background: var(--card);
+      border-radius: 20px;
+      padding: 28px 28px 32px;
+      box-shadow: 0 18px 40px var(--shadow);
+      border: 1px solid rgba(17, 17, 17, 0.08);
+      display: grid;
+      gap: 18px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(120deg, rgba(255, 255, 255, 0.6) 0%, rgba(255, 255, 255, 0) 60%);
+      pointer-events: none;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 2rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.98rem;
+    }
+
+    label {
+      font-size: 0.9rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 90px;
+      border-radius: 12px;
+      border: 1px solid rgba(17, 17, 17, 0.18);
+      padding: 12px 14px;
+      font-size: 1rem;
+      font-family: inherit;
+      background: #faf8f4;
+      color: var(--ink);
+      resize: vertical;
+    }
+
+    textarea:focus {
+      outline: 2px solid rgba(13, 27, 42, 0.2);
+      border-color: rgba(13, 27, 42, 0.4);
+    }
+
+    #error-msg {
+      color: var(--error);
+      font-size: 0.9rem;
+      min-height: 1.2em;
+    }
+
+    .canvas-wrap {
+      display: grid;
+      place-items: center;
+      padding: 12px 0 4px;
+    }
+
+    canvas {
+      border-radius: 0;
+      box-shadow: 0 0 0 1px rgba(17, 17, 17, 0.08);
+      background: #ffffff;
+    }
+
+    @media (max-width: 480px) {
+      .card {
+        padding: 22px;
+      }
+
+      h1 {
+        font-size: 1.6rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div>
+      <h1>QRL</h1>
+      <p class="subtitle">Minimalist QR generator for any text or URL.</p>
+    </div>
+
+    <div>
+      <label for="text-input">Text to encode</label>
+      <textarea id="text-input" placeholder="Paste a URL or type any text..."></textarea>
+      <div id="error-msg" aria-live="polite"></div>
+    </div>
+
+    <div class="canvas-wrap">
+      <canvas id="qr-canvas"></canvas>
+    </div>
+  </main>
+
+  <script>
+    "use strict";
+
+    const ECC_LEVEL = "M";
+    const ECC_LEVEL_BITS = { L: 1, M: 0, Q: 3, H: 2 };
+    const MODULE_SIZE = 5;
+    const QUIET_ZONE = 4;
+
+    const GF256 = (() => {
+      const exp = new Array(512).fill(0);
+      const log = new Array(256).fill(0);
+      let x = 1;
+      for (let i = 0; i < 256; i++) {
+        exp[i] = x;
+        log[x] = i;
+        x <<= 1;
+        if (x & 0x100) {
+          x ^= 0x11d;
+        }
+      }
+      for (let i = 256; i < 512; i++) {
+        exp[i] = exp[i - 255];
+      }
+
+      return {
+        exp,
+        log,
+        add(x, y) {
+          return x ^ y;
+        },
+        sub(x, y) {
+          return x ^ y;
+        },
+        multiply(x, y) {
+          if (x === 0 || y === 0) return 0;
+          return exp[log[x] + log[y]];
+        },
+        divide(x, y) {
+          if (y === 0) throw new Error("GF256 divide by zero");
+          if (x === 0) return 0;
+          return exp[(log[x] + 255 - log[y]) % 255];
+        }
+      };
+    })();
+
+    class BitBuffer {
+      constructor() {
+        this.bits = [];
+      }
+
+      put(value, length) {
+        for (let i = length - 1; i >= 0; i--) {
+          this.bits.push((value >> i) & 1);
+        }
+      }
+
+      get length() {
+        return this.bits.length;
+      }
+
+      toBytes() {
+        const bytes = [];
+        for (let i = 0; i < this.bits.length; i += 8) {
+          let byte = 0;
+          for (let j = 0; j < 8; j++) {
+            byte = (byte << 1) | (this.bits[i + j] || 0);
+          }
+          bytes.push(byte);
+        }
+        return bytes;
+      }
+    }
+
+    const RS_BLOCK_TABLE_M = [
+      [1, 26, 16],
+      [1, 44, 28],
+      [1, 70, 44],
+      [2, 50, 32],
+      [2, 67, 43],
+      [4, 43, 27],
+      [4, 49, 31],
+      [2, 60, 38, 2, 61, 39],
+      [3, 58, 36, 2, 59, 37],
+      [4, 69, 43, 1, 70, 44],
+      [1, 80, 50, 4, 81, 51],
+      [6, 58, 36, 2, 59, 37],
+      [8, 59, 37, 1, 60, 38],
+      [4, 64, 40, 5, 65, 41],
+      [5, 65, 41, 5, 66, 42],
+      [7, 73, 45, 3, 74, 46],
+      [10, 74, 46, 1, 75, 47],
+      [9, 69, 43, 4, 70, 44],
+      [3, 70, 44, 11, 71, 45],
+      [3, 67, 41, 13, 68, 42],
+      [17, 68, 42],
+      [17, 74, 46],
+      [4, 75, 47, 14, 76, 48],
+      [6, 73, 45, 14, 74, 46],
+      [8, 75, 47, 13, 76, 48],
+      [19, 74, 46, 4, 75, 47],
+      [22, 73, 45, 3, 74, 46],
+      [3, 73, 45, 23, 74, 46],
+      [21, 73, 45, 7, 74, 46],
+      [19, 75, 47, 10, 76, 48],
+      [2, 74, 46, 29, 75, 47],
+      [10, 74, 46, 23, 75, 47],
+      [14, 74, 46, 21, 75, 47],
+      [14, 74, 46, 23, 75, 47],
+      [12, 75, 47, 26, 76, 48],
+      [6, 75, 47, 34, 76, 48],
+      [29, 74, 46, 14, 75, 47],
+      [13, 74, 46, 32, 75, 47],
+      [40, 75, 47, 7, 76, 48],
+      [18, 75, 47, 31, 76, 48]
+    ];
+
+    function getRsBlocks(version) {
+      const entry = RS_BLOCK_TABLE_M[version - 1];
+      const blocks = [];
+      for (let i = 0; i < entry.length; i += 3) {
+        const count = entry[i];
+        const total = entry[i + 1];
+        const data = entry[i + 2];
+        for (let j = 0; j < count; j++) {
+          blocks.push({
+            totalCount: total,
+            dataCount: data,
+            ecCount: total - data
+          });
+        }
+      }
+      return blocks;
+    }
+
+    function getTotalDataCodewords(version) {
+      return getRsBlocks(version).reduce((sum, block) => sum + block.dataCount, 0);
+    }
+
+    function toUtf8Bytes(text) {
+      return Array.from(new TextEncoder().encode(text));
+    }
+
+    function getBestVersion(text) {
+      const bytes = toUtf8Bytes(text);
+      for (let version = 1; version <= 40; version++) {
+        const dataCodewords = getTotalDataCodewords(version);
+        const capacityBits = dataCodewords * 8;
+        const lengthBits = version < 10 ? 8 : 16;
+        const neededBits = 4 + lengthBits + bytes.length * 8;
+        if (neededBits <= capacityBits) {
+          return version;
+        }
+      }
+      throw new Error("Input is too long");
+    }
+
+    function encodeText(text, version) {
+      const bytes = toUtf8Bytes(text);
+      const dataCodewords = getTotalDataCodewords(version);
+      const capacityBits = dataCodewords * 8;
+      const buffer = new BitBuffer();
+
+      buffer.put(0b0100, 4);
+      buffer.put(bytes.length, version < 10 ? 8 : 16);
+      bytes.forEach((b) => buffer.put(b, 8));
+
+      const remaining = capacityBits - buffer.length;
+      if (remaining > 0) {
+        buffer.put(0, Math.min(4, remaining));
+      }
+
+      while (buffer.length % 8 !== 0) {
+        buffer.put(0, 1);
+      }
+
+      const padBytes = [0xec, 0x11];
+      let padIndex = 0;
+      while (buffer.length < capacityBits) {
+        buffer.put(padBytes[padIndex], 8);
+        padIndex = (padIndex + 1) % padBytes.length;
+      }
+
+      return buffer.toBytes();
+    }
+
+    const GeneratorCache = new Map();
+
+    function buildGeneratorPolynomial(ecCount) {
+      if (GeneratorCache.has(ecCount)) {
+        return GeneratorCache.get(ecCount);
+      }
+      let poly = [1];
+      for (let i = 0; i < ecCount; i++) {
+        poly = multiplyPolynomials(poly, [1, GF256.exp[i]]);
+      }
+      GeneratorCache.set(ecCount, poly);
+      return poly;
+    }
+
+    function multiplyPolynomials(p1, p2) {
+      const result = new Array(p1.length + p2.length - 1).fill(0);
+      for (let i = 0; i < p1.length; i++) {
+        for (let j = 0; j < p2.length; j++) {
+          result[i + j] ^= GF256.multiply(p1[i], p2[j]);
+        }
+      }
+      return result;
+    }
+
+    function generateEcBytes(dataBytes, ecCount) {
+      const generator = buildGeneratorPolynomial(ecCount);
+      const buffer = dataBytes.concat(new Array(ecCount).fill(0));
+      for (let i = 0; i < dataBytes.length; i++) {
+        const factor = buffer[i];
+        if (factor === 0) continue;
+        for (let j = 0; j < generator.length; j++) {
+          buffer[i + j] ^= GF256.multiply(generator[j], factor);
+        }
+      }
+      return buffer.slice(dataBytes.length);
+    }
+
+    function createFinalCodewords(dataBytes, version) {
+      const blocks = getRsBlocks(version);
+      const blockData = [];
+      const blockEc = [];
+      let offset = 0;
+      let maxDataLen = 0;
+      let maxEcLen = 0;
+
+      blocks.forEach((block) => {
+        const chunk = dataBytes.slice(offset, offset + block.dataCount);
+        offset += block.dataCount;
+        const ec = generateEcBytes(chunk, block.ecCount);
+        blockData.push(chunk);
+        blockEc.push(ec);
+        maxDataLen = Math.max(maxDataLen, chunk.length);
+        maxEcLen = Math.max(maxEcLen, ec.length);
+      });
+
+      const result = [];
+      for (let i = 0; i < maxDataLen; i++) {
+        blockData.forEach((chunk) => {
+          if (i < chunk.length) result.push(chunk[i]);
+        });
+      }
+      for (let i = 0; i < maxEcLen; i++) {
+        blockEc.forEach((chunk) => {
+          if (i < chunk.length) result.push(chunk[i]);
+        });
+      }
+      return result;
+    }
+
+    const QRUtil = {
+      getBCHDigit(data) {
+        let digit = 0;
+        while (data !== 0) {
+          digit++;
+          data >>= 1;
+        }
+        return digit;
+      },
+      getBCHTypeInfo(data) {
+        let d = data << 10;
+        const poly = 0x537;
+        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly) >= 0) {
+          d ^= poly << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly));
+        }
+        return ((data << 10) | d) ^ 0x5412;
+      },
+      getBCHTypeNumber(data) {
+        let d = data << 12;
+        const poly = 0x1f25;
+        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly) >= 0) {
+          d ^= poly << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly));
+        }
+        return (data << 12) | d;
+      },
+      getMaskCondition(mask, row, col) {
+        switch (mask) {
+          case 0:
+            return (row + col) % 2 === 0;
+          case 1:
+            return row % 2 === 0;
+          case 2:
+            return col % 3 === 0;
+          case 3:
+            return (row + col) % 3 === 0;
+          case 4:
+            return (Math.floor(row / 2) + Math.floor(col / 3)) % 2 === 0;
+          case 5:
+            return ((row * col) % 2) + ((row * col) % 3) === 0;
+          case 6:
+            return ((((row * col) % 2) + ((row * col) % 3)) % 2) === 0;
+          case 7:
+            return ((((row + col) % 2) + ((row * col) % 3)) % 2) === 0;
+          default:
+            return false;
+        }
+      }
+    };
+
+    class QRMatrix {
+      constructor(version) {
+        this.version = version;
+        this.size = 21 + (version - 1) * 4;
+        this.modules = Array.from({ length: this.size }, () => Array(this.size).fill(null));
+        this.reserved = Array.from({ length: this.size }, () => Array(this.size).fill(false));
+        this.dataModules = Array.from({ length: this.size }, () => Array(this.size).fill(false));
+      }
+
+      setModule(row, col, value, reserve = true) {
+        if (row < 0 || col < 0 || row >= this.size || col >= this.size) return;
+        this.modules[row][col] = value;
+        if (reserve) {
+          this.reserved[row][col] = true;
+        }
+      }
+
+      drawFinderPattern(row, col) {
+        for (let r = -1; r <= 7; r++) {
+          for (let c = -1; c <= 7; c++) {
+            const rr = row + r;
+            const cc = col + c;
+            if (rr < 0 || cc < 0 || rr >= this.size || cc >= this.size) continue;
+            if (r === -1 || r === 7 || c === -1 || c === 7) {
+              this.setModule(rr, cc, 0, true);
+            } else if (r === 0 || r === 6 || c === 0 || c === 6) {
+              this.setModule(rr, cc, 1, true);
+            } else if (r === 1 || r === 5 || c === 1 || c === 5) {
+              this.setModule(rr, cc, 0, true);
+            } else {
+              this.setModule(rr, cc, 1, true);
+            }
+          }
+        }
+      }
+
+      drawFinderPatterns() {
+        this.drawFinderPattern(0, 0);
+        this.drawFinderPattern(0, this.size - 7);
+        this.drawFinderPattern(this.size - 7, 0);
+      }
+
+      drawTimingPatterns() {
+        for (let i = 0; i < this.size; i++) {
+          if (!this.reserved[6][i]) {
+            this.setModule(6, i, i % 2 === 0 ? 1 : 0, true);
+          }
+          if (!this.reserved[i][6]) {
+            this.setModule(i, 6, i % 2 === 0 ? 1 : 0, true);
+          }
+        }
+      }
+
+      getAlignmentPatternCenters() {
+        if (this.version === 1) return [];
+        const num = Math.floor(this.version / 7) + 2;
+        const step = this.version === 32
+          ? 26
+          : Math.floor((this.size - 13) / (num - 1));
+        const centers = [6];
+        for (let i = 1; i < num - 1; i++) {
+          centers.push(6 + step * i);
+        }
+        centers.push(this.size - 7);
+        return centers;
+      }
+
+      drawAlignmentPatterns() {
+        const centers = this.getAlignmentPatternCenters();
+        if (!centers.length) return;
+        centers.forEach((row) => {
+          centers.forEach((col) => {
+            if (this.reserved[row][col]) return;
+            this.drawAlignmentPattern(row - 2, col - 2);
+          });
+        });
+      }
+
+      drawAlignmentPattern(row, col) {
+        for (let r = 0; r < 5; r++) {
+          for (let c = 0; c < 5; c++) {
+            const rr = row + r;
+            const cc = col + c;
+            if (rr < 0 || cc < 0 || rr >= this.size || cc >= this.size) continue;
+            if (r === 0 || r === 4 || c === 0 || c === 4) {
+              this.setModule(rr, cc, 1, true);
+            } else if (r === 2 && c === 2) {
+              this.setModule(rr, cc, 1, true);
+            } else {
+              this.setModule(rr, cc, 0, true);
+            }
+          }
+        }
+      }
+
+      reserveFormatInfo() {
+        for (let i = 0; i < 6; i++) {
+          this.reserved[8][i] = true;
+          this.reserved[i][8] = true;
+        }
+        this.reserved[8][7] = true;
+        this.reserved[8][8] = true;
+        this.reserved[7][8] = true;
+        for (let i = this.size - 1; i >= this.size - 8; i--) {
+          this.reserved[8][i] = true;
+        }
+        for (let i = this.size - 1; i >= this.size - 7; i--) {
+          this.reserved[i][8] = true;
+        }
+      }
+
+      drawVersionInfo() {
+        if (this.version < 7) return;
+        const bits = QRUtil.getBCHTypeNumber(this.version);
+        for (let i = 0; i < 18; i++) {
+          const bit = (bits >> i) & 1;
+          const r = Math.floor(i / 3);
+          const c = i % 3;
+          const topRow = r;
+          const topCol = c + this.size - 11;
+          const leftRow = c + this.size - 11;
+          const leftCol = r;
+          this.setModule(topRow, topCol, bit, true);
+          this.setModule(leftRow, leftCol, bit, true);
+        }
+      }
+
+      setDarkModule() {
+        this.setModule(this.size - 8, 8, 1, true);
+      }
+
+      placeData(codewords) {
+        const bits = [];
+        codewords.forEach((byte) => {
+          for (let i = 7; i >= 0; i--) {
+            bits.push((byte >> i) & 1);
+          }
+        });
+
+        let bitIndex = 0;
+        let direction = -1;
+        for (let col = this.size - 1; col > 0; col -= 2) {
+          if (col === 6) col--;
+          for (let i = 0; i < this.size; i++) {
+            const row = direction === -1 ? this.size - 1 - i : i;
+            for (let offset = 0; offset < 2; offset++) {
+              const c = col - offset;
+              if (this.reserved[row][c]) continue;
+              const bit = bitIndex < bits.length ? bits[bitIndex++] : 0;
+              this.modules[row][c] = bit;
+              this.dataModules[row][c] = true;
+            }
+          }
+          direction *= -1;
+        }
+      }
+
+      applyMask(modules, maskIndex) {
+        for (let row = 0; row < this.size; row++) {
+          for (let col = 0; col < this.size; col++) {
+            if (!this.dataModules[row][col]) continue;
+            if (QRUtil.getMaskCondition(maskIndex, row, col)) {
+              modules[row][col] ^= 1;
+            }
+          }
+        }
+      }
+
+      drawFormatBits(modules, maskIndex) {
+        const data = (ECC_LEVEL_BITS[ECC_LEVEL] << 3) | maskIndex;
+        const bits = QRUtil.getBCHTypeInfo(data);
+        for (let i = 0; i < 15; i++) {
+          const bit = (bits >> i) & 1;
+          if (i < 6) {
+            modules[i][8] = bit;
+          } else if (i < 8) {
+            modules[i + 1][8] = bit;
+          } else {
+            modules[this.size - 15 + i][8] = bit;
+          }
+
+          if (i < 8) {
+            modules[8][this.size - i - 1] = bit;
+          } else if (i < 9) {
+            modules[8][7] = bit;
+          } else {
+            modules[8][15 - i - 1] = bit;
+          }
+        }
+      }
+
+      cloneModules() {
+        return this.modules.map((row) => row.slice());
+      }
+    }
+
+    function calculatePenalty(modules) {
+      const size = modules.length;
+      let penalty = 0;
+
+      // Rule 1: Adjacent modules in row/column in same color.
+      for (let row = 0; row < size; row++) {
+        let runColor = modules[row][0];
+        let runLength = 1;
+        for (let col = 1; col < size; col++) {
+          if (modules[row][col] === runColor) {
+            runLength++;
+          } else {
+            if (runLength >= 5) penalty += 3 + (runLength - 5);
+            runColor = modules[row][col];
+            runLength = 1;
+          }
+        }
+        if (runLength >= 5) penalty += 3 + (runLength - 5);
+      }
+
+      for (let col = 0; col < size; col++) {
+        let runColor = modules[0][col];
+        let runLength = 1;
+        for (let row = 1; row < size; row++) {
+          if (modules[row][col] === runColor) {
+            runLength++;
+          } else {
+            if (runLength >= 5) penalty += 3 + (runLength - 5);
+            runColor = modules[row][col];
+            runLength = 1;
+          }
+        }
+        if (runLength >= 5) penalty += 3 + (runLength - 5);
+      }
+
+      // Rule 2: 2x2 blocks.
+      for (let row = 0; row < size - 1; row++) {
+        for (let col = 0; col < size - 1; col++) {
+          const color = modules[row][col];
+          if (
+            color === modules[row][col + 1] &&
+            color === modules[row + 1][col] &&
+            color === modules[row + 1][col + 1]
+          ) {
+            penalty += 3;
+          }
+        }
+      }
+
+      // Rule 3: Finder-like patterns.
+      const pattern1 = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+      const pattern2 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+      const matchesPattern = (line, idx, pattern) => {
+        for (let i = 0; i < pattern.length; i++) {
+          if (line[idx + i] !== pattern[i]) return false;
+        }
+        return true;
+      };
+
+      for (let row = 0; row < size; row++) {
+        const line = modules[row];
+        for (let col = 0; col <= size - 11; col++) {
+          if (matchesPattern(line, col, pattern1) || matchesPattern(line, col, pattern2)) {
+            penalty += 40;
+          }
+        }
+      }
+
+      for (let col = 0; col < size; col++) {
+        const line = [];
+        for (let row = 0; row < size; row++) {
+          line.push(modules[row][col]);
+        }
+        for (let row = 0; row <= size - 11; row++) {
+          if (matchesPattern(line, row, pattern1) || matchesPattern(line, row, pattern2)) {
+            penalty += 40;
+          }
+        }
+      }
+
+      // Rule 4: Balance of dark modules.
+      let darkCount = 0;
+      for (let row = 0; row < size; row++) {
+        for (let col = 0; col < size; col++) {
+          if (modules[row][col] === 1) darkCount++;
+        }
+      }
+      const total = size * size;
+      const percent = (darkCount * 100) / total;
+      const k = Math.floor(Math.abs(percent - 50) / 5);
+      penalty += k * 10;
+
+      return penalty;
+    }
+
+    function generateQR(text) {
+      const version = getBestVersion(text);
+      const dataBytes = encodeText(text, version);
+      const codewords = createFinalCodewords(dataBytes, version);
+      const matrix = new QRMatrix(version);
+      matrix.drawFinderPatterns();
+      matrix.drawAlignmentPatterns();
+      matrix.drawTimingPatterns();
+      matrix.reserveFormatInfo();
+      matrix.drawVersionInfo();
+      matrix.setDarkModule();
+      matrix.placeData(codewords);
+
+      let bestMask = 0;
+      let bestPenalty = Infinity;
+      let bestModules = null;
+
+      for (let mask = 0; mask < 8; mask++) {
+        const candidate = matrix.cloneModules();
+        matrix.applyMask(candidate, mask);
+        matrix.drawFormatBits(candidate, mask);
+        const penalty = calculatePenalty(candidate);
+        if (penalty < bestPenalty) {
+          bestPenalty = penalty;
+          bestMask = mask;
+          bestModules = candidate;
+        }
+      }
+
+      matrix.modules = bestModules;
+      return matrix.modules;
+    }
+
+    function renderToCanvas(matrix, canvas) {
+      if (!matrix || matrix.length === 0) return;
+      const size = matrix.length;
+      const quietSize = size + QUIET_ZONE * 2;
+      const ctx = canvas.getContext("2d");
+      canvas.width = quietSize * MODULE_SIZE;
+      canvas.height = quietSize * MODULE_SIZE;
+      ctx.imageSmoothingEnabled = false;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#000000";
+      for (let row = 0; row < size; row++) {
+        for (let col = 0; col < size; col++) {
+          if (matrix[row][col] === 1) {
+            ctx.fillRect(
+              (col + QUIET_ZONE) * MODULE_SIZE,
+              (row + QUIET_ZONE) * MODULE_SIZE,
+              MODULE_SIZE,
+              MODULE_SIZE
+            );
+          }
+        }
+      }
+    }
+
+    function clearCanvas(canvas) {
+      const ctx = canvas.getContext("2d");
+      const quietSize = 21 + QUIET_ZONE * 2;
+      canvas.width = MODULE_SIZE * quietSize;
+      canvas.height = MODULE_SIZE * quietSize;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function runTests() {
+      const tests = [
+        GF256.add(1, 1) === 0,
+        GF256.multiply(3, 4) === 12,
+        getBestVersion("HELLO") === 1,
+        getBestVersion("A".repeat(20)) === 2
+      ];
+      if (tests.every(Boolean)) {
+        console.log("Tests: Pass");
+      } else {
+        console.log("Tests: Fail", tests);
+      }
+    }
+
+    const inputEl = document.getElementById("text-input");
+    const errorEl = document.getElementById("error-msg");
+    const canvasEl = document.getElementById("qr-canvas");
+
+    let lastMatrix = null;
+
+    function updateQR() {
+      const text = inputEl.value;
+      if (!text) {
+        errorEl.textContent = "";
+        lastMatrix = null;
+        clearCanvas(canvasEl);
+        return;
+      }
+      try {
+        const matrix = generateQR(text);
+        errorEl.textContent = "";
+        lastMatrix = matrix;
+        renderToCanvas(matrix, canvasEl);
+      } catch (err) {
+        errorEl.textContent = err.message || "Input is too long";
+        if (lastMatrix) {
+          renderToCanvas(lastMatrix, canvasEl);
+        } else {
+          clearCanvas(canvasEl);
+        }
+      }
+    }
+
+    inputEl.addEventListener("input", updateQR);
+
+    clearCanvas(canvasEl);
+    runTests();
+  </script>
+</body>
+</html>
