@@ -140,44 +140,68 @@
   <script>
     "use strict";
 
+    // === Configuration ===
     const ECC_LEVEL = "M";
     const ECC_LEVEL_BITS = { L: 1, M: 0, Q: 3, H: 2 };
-    const MODULE_SIZE = 5;
-    const QUIET_ZONE = 4;
+    const MODULE_SIZE = 5;                    // Pixels per QR module
+    const QUIET_ZONE = 4;                     // Modules of white border around QR
+
+    // === QR Code Specification Constants ===
+    // Base size for version 1 QR code (21x21 modules)
+    const QR_BASE_SIZE = 21;
+    // Size increment per version (4 modules)
+    const QR_SIZE_INCREMENT = 4;
+    // Finder pattern dimensions
+    const FINDER_PATTERN_SIZE = 7;
+    // Alignment pattern dimensions
+    const ALIGNMENT_PATTERN_SIZE = 5;
+    // Position of timing patterns
+    const TIMING_PATTERN_POS = 6;
+
+    // === BCH Error Correction Constants ===
+    // Generator polynomial for format info: x^10 + x^8 + x^5 + x^4 + x^2 + x + 1
+    const BCH_FORMAT_POLY = 0x537;
+    // Mask for format info XOR (ensures no all-zero format string)
+    const BCH_FORMAT_MASK = 0x5412;
+    // Generator polynomial for version info: x^12 + x^11 + x^10 + x^9 + x^8 + x^5 + x^2 + 1
+    const BCH_VERSION_POLY = 0x1f25;
+    // Minimum version that requires version information blocks
+    const MIN_VERSION_WITH_VERSION_INFO = 7;
 
     const GF256 = (() => {
       const exp = new Array(512).fill(0);
-      const log = new Array(256).fill(0);
+      const log = new Array(256).fill(-1); // -1 marks undefined (log(0) is undefined)
       let x = 1;
-      for (let i = 0; i < 256; i++) {
+      for (let i = 0; i < 255; i++) { // Only 0-254; exp[255] would wrap to exp[0]
         exp[i] = x;
         log[x] = i;
         x <<= 1;
         if (x & 0x100) {
-          x ^= 0x11d;
+          x ^= 0x11d; // GF(256) primitive polynomial: x^8 + x^4 + x^3 + x^2 + 1
         }
       }
-      for (let i = 256; i < 512; i++) {
+      // Extend exp table for easy modular arithmetic
+      for (let i = 255; i < 512; i++) {
         exp[i] = exp[i - 255];
       }
 
       return {
         exp,
         log,
-        add(x, y) {
-          return x ^ y;
+        add(a, b) {
+          return a ^ b;
         },
-        sub(x, y) {
-          return x ^ y;
+        sub(a, b) {
+          return a ^ b;
         },
-        multiply(x, y) {
-          if (x === 0 || y === 0) return 0;
-          return exp[log[x] + log[y]];
+        multiply(a, b) {
+          if (a === 0 || b === 0) return 0;
+          return exp[log[a] + log[b]];
         },
-        divide(x, y) {
-          if (y === 0) throw new Error("GF256 divide by zero");
-          if (x === 0) return 0;
-          return exp[(log[x] + 255 - log[y]) % 255];
+        divide(a, b) {
+          if (b === 0) throw new Error("GF256 divide by zero");
+          if (a === 0) return 0;
+          return exp[(log[a] + 255 - log[b]) % 255];
         }
       };
     })();
@@ -402,17 +426,15 @@
       },
       getBCHTypeInfo(data) {
         let d = data << 10;
-        const poly = 0x537;
-        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly) >= 0) {
-          d ^= poly << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly));
+        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(BCH_FORMAT_POLY) >= 0) {
+          d ^= BCH_FORMAT_POLY << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(BCH_FORMAT_POLY));
         }
-        return ((data << 10) | d) ^ 0x5412;
+        return ((data << 10) | d) ^ BCH_FORMAT_MASK;
       },
       getBCHTypeNumber(data) {
         let d = data << 12;
-        const poly = 0x1f25;
-        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly) >= 0) {
-          d ^= poly << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(poly));
+        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(BCH_VERSION_POLY) >= 0) {
+          d ^= BCH_VERSION_POLY << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(BCH_VERSION_POLY));
         }
         return (data << 12) | d;
       },
@@ -443,7 +465,7 @@
     class QRMatrix {
       constructor(version) {
         this.version = version;
-        this.size = 21 + (version - 1) * 4;
+        this.size = QR_BASE_SIZE + (version - 1) * QR_SIZE_INCREMENT;
         this.modules = Array.from({ length: this.size }, () => Array(this.size).fill(null));
         this.reserved = Array.from({ length: this.size }, () => Array(this.size).fill(false));
         this.dataModules = Array.from({ length: this.size }, () => Array(this.size).fill(false));
@@ -478,33 +500,66 @@
 
       drawFinderPatterns() {
         this.drawFinderPattern(0, 0);
-        this.drawFinderPattern(0, this.size - 7);
-        this.drawFinderPattern(this.size - 7, 0);
+        this.drawFinderPattern(0, this.size - FINDER_PATTERN_SIZE);
+        this.drawFinderPattern(this.size - FINDER_PATTERN_SIZE, 0);
       }
 
       drawTimingPatterns() {
         for (let i = 0; i < this.size; i++) {
-          if (!this.reserved[6][i]) {
-            this.setModule(6, i, i % 2 === 0 ? 1 : 0, true);
+          if (!this.reserved[TIMING_PATTERN_POS][i]) {
+            this.setModule(TIMING_PATTERN_POS, i, i % 2 === 0 ? 1 : 0, true);
           }
-          if (!this.reserved[i][6]) {
-            this.setModule(i, 6, i % 2 === 0 ? 1 : 0, true);
+          if (!this.reserved[i][TIMING_PATTERN_POS]) {
+            this.setModule(i, TIMING_PATTERN_POS, i % 2 === 0 ? 1 : 0, true);
           }
         }
       }
 
       getAlignmentPatternCenters() {
-        if (this.version === 1) return [];
-        const num = Math.floor(this.version / 7) + 2;
-        const step = this.version === 32
-          ? 26
-          : Math.floor((this.size - 13) / (num - 1));
-        const centers = [6];
-        for (let i = 1; i < num - 1; i++) {
-          centers.push(6 + step * i);
-        }
-        centers.push(this.size - 7);
-        return centers;
+        // Alignment pattern center positions per QR code specification (ISO/IEC 18004)
+        const ALIGNMENT_PATTERN_TABLE = [
+          [],                             // Version 1 - no alignment patterns
+          [6, 18],                         // Version 2
+          [6, 22],                         // Version 3
+          [6, 26],                         // Version 4
+          [6, 30],                         // Version 5
+          [6, 34],                         // Version 6
+          [6, 22, 38],                     // Version 7
+          [6, 24, 42],                     // Version 8
+          [6, 26, 46],                     // Version 9
+          [6, 28, 50],                     // Version 10
+          [6, 30, 54],                     // Version 11
+          [6, 32, 58],                     // Version 12
+          [6, 34, 62],                     // Version 13
+          [6, 26, 46, 66],                 // Version 14
+          [6, 26, 48, 70],                 // Version 15
+          [6, 26, 50, 74],                 // Version 16
+          [6, 30, 54, 78],                 // Version 17
+          [6, 30, 56, 82],                 // Version 18
+          [6, 30, 58, 86],                 // Version 19
+          [6, 34, 62, 90],                 // Version 20
+          [6, 28, 50, 72, 94],             // Version 21
+          [6, 26, 50, 74, 98],             // Version 22
+          [6, 30, 54, 78, 102],            // Version 23
+          [6, 28, 54, 80, 106],            // Version 24
+          [6, 32, 58, 84, 110],            // Version 25
+          [6, 30, 58, 86, 114],            // Version 26
+          [6, 34, 62, 90, 118],            // Version 27
+          [6, 26, 50, 74, 98, 122],        // Version 28
+          [6, 30, 54, 78, 102, 126],       // Version 29
+          [6, 26, 52, 78, 104, 130],       // Version 30
+          [6, 30, 56, 82, 108, 134],       // Version 31
+          [6, 34, 60, 86, 112, 138],       // Version 32
+          [6, 30, 58, 86, 114, 142],       // Version 33
+          [6, 34, 62, 90, 118, 146],       // Version 34
+          [6, 30, 54, 78, 102, 126, 150],  // Version 35
+          [6, 24, 50, 76, 102, 128, 154],  // Version 36
+          [6, 28, 54, 80, 106, 132, 158],  // Version 37
+          [6, 32, 58, 84, 110, 136, 162],  // Version 38
+          [6, 26, 54, 82, 110, 138, 166],  // Version 39
+          [6, 30, 58, 86, 114, 142, 170]   // Version 40
+        ];
+        return ALIGNMENT_PATTERN_TABLE[this.version - 1];
       }
 
       drawAlignmentPatterns() {
@@ -513,7 +568,8 @@
         centers.forEach((row) => {
           centers.forEach((col) => {
             if (this.reserved[row][col]) return;
-            this.drawAlignmentPattern(row - 2, col - 2);
+            const offset = Math.floor(ALIGNMENT_PATTERN_SIZE / 2);
+            this.drawAlignmentPattern(row - offset, col - offset);
           });
         });
       }
@@ -552,7 +608,7 @@
       }
 
       drawVersionInfo() {
-        if (this.version < 7) return;
+        if (this.version < MIN_VERSION_WITH_VERSION_INFO) return;
         const bits = QRUtil.getBCHTypeNumber(this.version);
         for (let i = 0; i < 18; i++) {
           const bit = (bits >> i) & 1;
@@ -568,7 +624,8 @@
       }
 
       setDarkModule() {
-        this.setModule(this.size - 8, 8, 1, true);
+        // Dark module is always at position (4*version + 9, 8) which equals (size - 8, 8)
+        this.setModule(this.size - (FINDER_PATTERN_SIZE + 1), 8, 1, true);
       }
 
       placeData(codewords) {
@@ -744,7 +801,6 @@
       matrix.setDarkModule();
       matrix.placeData(codewords);
 
-      let bestMask = 0;
       let bestPenalty = Infinity;
       let bestModules = null;
 
@@ -755,7 +811,6 @@
         const penalty = calculatePenalty(candidate);
         if (penalty < bestPenalty) {
           bestPenalty = penalty;
-          bestMask = mask;
           bestModules = candidate;
         }
       }
@@ -791,7 +846,7 @@
 
     function clearCanvas(canvas) {
       const ctx = canvas.getContext("2d");
-      const quietSize = 21 + QUIET_ZONE * 2;
+      const quietSize = QR_BASE_SIZE + QUIET_ZONE * 2;
       canvas.width = MODULE_SIZE * quietSize;
       canvas.height = MODULE_SIZE * quietSize;
       ctx.fillStyle = "#ffffff";
